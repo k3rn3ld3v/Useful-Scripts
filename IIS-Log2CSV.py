@@ -1,5 +1,6 @@
 import argparse
 import logging
+import csv
 import pandas as pd
 from pathlib import Path
 from time import time
@@ -40,18 +41,21 @@ def validate_log_data(file_path):
 
 def write_to_csv(destination_file, headers, log_line_generator):
     """
-    Write log data to a CSV file in chunks.
+    Write log data to a CSV file in chunks, ensuring proper handling of fields with commas.
     """
-    with open(destination_file, "w", encoding="utf-8") as out_file:
-        out_file.write(",".join(headers) + "\n")
+    with open(destination_file, "w", newline="", encoding="utf-8") as out_file:
+        writer = csv.writer(out_file, quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(headers)  # Write headers to the CSV file
+
         chunk = []
         for line in log_line_generator:
-            chunk.append(",".join(line.split()))
+            # Split the line into fields and write it to the CSV
+            chunk.append(line.split())
             if len(chunk) >= CHUNK_SIZE:
-                out_file.write("\n".join(chunk) + "\n")
+                writer.writerows(chunk)
                 chunk.clear()
         if chunk:
-            out_file.write("\n".join(chunk) + "\n")
+            writer.writerows(chunk)
 
 
 def write_to_excel(destination_file, headers, log_line_generator):
