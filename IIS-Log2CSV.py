@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
@@ -15,70 +15,103 @@ logging.basicConfig(
     ],
 )
 
-def validate_log_data(lines, source_file):
+CHUNK_SIZE = 10_000
+EXCEL_ROW_LIMIT = 1_048_576
+
+
+def validate_log_data(file_path):
     """
-    Validate IIS log data: check for headers and consistent rows.
+    Validate IIS log data and extract headers and a generator for rows.
     """
-    header_line = next((line for line in reversed(lines) if line.startswith("#Fields")), None)
-    if not header_line:
-        raise ValueError(f"No #Fields line found in log file: {source_file}")
+    with open(file_path, "r", encoding="utf-8") as f:
+        headers = None
+        log_lines = []
+        for line in f:
+            if line.startswith("#Fields"):
+                headers = line.strip().split(" ")[1:]
+            elif not line.startswith("#") and line.strip():
+                log_lines.append(line.strip())
+        if not headers:
+            raise ValueError(f"No #Fields line found in log file: {file_path}")
+        if not log_lines:
+            raise ValueError(f"No valid data lines found in log file: {file_path}")
+    return headers, (line for line in log_lines)
 
-    headers = header_line.strip().split(" ")[1:]
-    log_lines = [line.strip() for line in lines if not line.startswith("#") and line.strip()]
 
-    if not log_lines:
-        raise ValueError(f"No valid data lines found in log file: {source_file}")
+def write_to_csv(destination_file, headers, log_line_generator):
+    """
+    Write log data to a CSV file in chunks.
+    """
+    with open(destination_file, "w", encoding="utf-8") as out_file:
+        out_file.write(",".join(headers) + "\n")
+        chunk = []
+        for line in log_line_generator:
+            chunk.append(",".join(line.split()))
+            if len(chunk) >= CHUNK_SIZE:
+                out_file.write("\n".join(chunk) + "\n")
+                chunk.clear()
+        if chunk:
+            out_file.write("\n".join(chunk) + "\n")
 
-    inconsistent_rows = [
-        i + 1 for i, row in enumerate(log_lines) if len(row.split()) != len(headers)
-    ]
-    if inconsistent_rows:
-        raise ValueError(
-            f"Inconsistent rows found in log file {source_file}. Rows: {inconsistent_rows}"
-        )
 
-    return headers, log_lines
+def write_to_excel(destination_file, headers, log_line_generator):
+    """
+    Write log data to an Excel file in chunks, handling row limits.
+    """
+    with pd.ExcelWriter(destination_file, engine="openpyxl") as writer:
+        sheet_number = 1
+        current_row_count = 0
+        chunk = []
+        for line in log_line_generator:
+            chunk.append(line.split())
+            current_row_count += 1
+            if len(chunk) >= CHUNK_SIZE:
+                pd.DataFrame(chunk, columns=headers).to_excel(
+                    writer, index=False, sheet_name=f"Sheet{sheet_number}"
+                )
+                chunk.clear()
+            if current_row_count >= EXCEL_ROW_LIMIT:
+                sheet_number += 1
+                current_row_count = 0
+        if chunk:
+            pd.DataFrame(chunk, columns=headers).to_excel(
+                writer, index=False, sheet_name=f"Sheet{sheet_number}"
+            )
+
 
 def convert_log_to_output(args):
     """
-    Convert a single IIS log file to the specified output format (CSV/XLSX).
+    Convert a single IIS log file to the specified output format.
     """
     log_file, source_dir, destination_dir, output_format = args
     try:
         relative_path = log_file.relative_to(source_dir)
         destination_file = destination_dir / relative_path
-
-        with open(log_file, "r", encoding="utf-8") as file:
-            lines = file.readlines()
-
-        headers, log_lines = validate_log_data(lines, log_file)
-        df = pd.DataFrame([line.split() for line in log_lines], columns=headers)
-
+        destination_file = destination_file.with_suffix(f".{output_format.lower()}")
         destination_file.parent.mkdir(parents=True, exist_ok=True)
 
+        headers, log_line_generator = validate_log_data(log_file)
+
         if output_format.lower() == "csv":
-            df.to_csv(destination_file.with_suffix(".csv"), index=False)
+            write_to_csv(destination_file, headers, log_line_generator)
         elif output_format.lower() == "xlsx":
-            df.to_excel(destination_file.with_suffix(".xlsx"), index=False, engine="openpyxl")
+            write_to_excel(destination_file, headers, log_line_generator)
         else:
             raise ValueError(f"Unsupported output format: {output_format}")
 
         logging.info(f"Converted: {log_file} -> {destination_file}")
-    except FileNotFoundError:
-        logging.error(f"File not found: {log_file}. Skipping...")
-    except UnicodeDecodeError:
-        logging.error(f"File {log_file} has an unsupported encoding. Skipping...")
     except Exception as e:
         logging.error(f"Failed to process {log_file}: {e}")
+
 
 def process_log_files_parallel(log_files, source_dir, destination_dir, output_format):
     """
     Process log files in parallel using ProcessPoolExecutor.
     """
     args = [(log_file, source_dir, destination_dir, output_format) for log_file in log_files]
-
     with ProcessPoolExecutor() as executor:
         executor.map(convert_log_to_output, args)
+
 
 def process_folder(source_dir, destination_dir, recurse, output_format):
     """
@@ -93,6 +126,7 @@ def process_folder(source_dir, destination_dir, recurse, output_format):
 
     logging.info(f"Found {len(log_files)} log files in: {source_dir}")
     process_log_files_parallel(log_files, source_dir, destination_dir, output_format)
+
 
 def main():
     parser = argparse.ArgumentParser(description="IIS Log Parser")
@@ -117,7 +151,6 @@ def main():
         if not source_file.exists():
             logging.error(f"Source file not found: {source_file}")
             return
-
         if not destination_file:
             logging.error("Output file path must be specified with --file.")
             return
@@ -131,7 +164,6 @@ def main():
         if not source_dir.exists():
             logging.error(f"Source folder not found: {source_dir}")
             return
-
         if not destination_dir:
             logging.error("Output folder path must be specified with --folder.")
             return
@@ -140,6 +172,7 @@ def main():
 
     end_time = time()
     logging.info(f"Script completed in {end_time - start_time:.2f} seconds.")
+
 
 if __name__ == "__main__":
     main()
